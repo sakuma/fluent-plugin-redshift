@@ -23,7 +23,7 @@ class RedshiftOutput < BufferedOutput
   config_param :aws_key_id, :string
   config_param :aws_sec_key, :string
   config_param :s3_bucket, :string
-  config_param :s3_endpoint, :string, :default => nil
+  config_param :s3_region, :string, :default => nil
   config_param :path, :string, :default => ""
   config_param :timestamp_key_format, :string, :default => 'year=%Y/month=%m/day=%d/hour=%H/%Y%m%d-%H%M'
   config_param :utc, :bool, :default => false
@@ -69,7 +69,7 @@ class RedshiftOutput < BufferedOutput
       :access_key_id     => @aws_key_id,
       :secret_access_key => @aws_sec_key
     }
-    options[:s3_endpoint] = @s3_endpoint if @s3_endpoint
+    options[:region] = @s3_region if @s3_region
     @s3 = AWS::S3.new(options)
     @bucket = @s3.buckets[@s3_bucket]
   end
