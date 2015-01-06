@@ -59,16 +59,16 @@ class RedshiftOutput < BufferedOutput
     }
     @delimiter = determine_delimiter(@file_type) if @delimiter.nil? or @delimiter.empty?
     $log.debug format_log("redshift file_type:#{@file_type} delimiter:'#{@delimiter}'")
-    @copy_sql_template = "copy #{table_name_with_schema} from '%s' CREDENTIALS 'aws_access_key_id=#{@aws_key_id};aws_secret_access_key=%s' delimiter '#{@delimiter}' GZIP ESCAPE #{@redshift_copy_base_options} #{@redshift_copy_options};"
   end
 
   def start
     super
     # init s3 conf
-    options = {
-      :access_key_id     => @aws_key_id,
-      :secret_access_key => @aws_sec_key
-    }
+    options = {}
+    if @aws_key_id && @aws_sec_key
+      options[:access_key_id] = @aws_key_id
+      options[:secret_access_key] = @aws_sec_key
+    end
     options[:region] = @s3_region if @s3_region
     @s3 = AWS::S3.new(options)
     @bucket = @s3.buckets[@s3_bucket]
@@ -114,7 +114,9 @@ class RedshiftOutput < BufferedOutput
 
     # copy gz on s3 to redshift
     s3_uri = "s3://#{@s3_bucket}/#{s3path}"
-    sql = @copy_sql_template % [s3_uri, @aws_sec_key]
+
+    credentials = @s3.client.credential_provider.credentials
+    sql = "copy #{table_name_with_schema} from '#{s3_uri}' CREDENTIALS 'aws_access_key_id=#{credentials[:access_key_id]};aws_secret_access_key=#{credentials[:secret_access_key]}#{';token=' + credentials[:session_token] if credentials[:session_token]}' delimiter '#{@delimiter}' GZIP ESCAPE #{@redshift_copy_base_options} #{@redshift_copy_options};"
     $log.debug format_log("start copying. s3_uri=#{s3_uri}")
 
     begin
