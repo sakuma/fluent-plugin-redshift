@@ -1,18 +1,21 @@
 require 'test_helper'
 
 require 'fluent/test'
-require 'fluent/plugin/out_redshift'
+require 'fluent/plugin/out_redshift-out'
 require 'flexmock/test_unit'
 require 'zlib'
 
 
 class RedshiftOutputTest < Test::Unit::TestCase
   def setup
-    require 'aws-sdk'
+    require 'aws-sdk-v1'
     require 'pg'
     require 'csv'
     Fluent::Test.setup
+    PG::Error.module_eval { attr_accessor :result}
   end
+
+  MAINTENANCE_FILE_PATH_FOR_TEST = "/tmp/fluentd_redshift_plugin_test_maintenance"
 
   CONFIG_BASE= %[
     aws_key_id test_key_id
@@ -27,6 +30,7 @@ class RedshiftOutputTest < Test::Unit::TestCase
     buffer_type memory
     utc
     log_suffix id:5 host:localhost
+    maintenance_file_path #{MAINTENANCE_FILE_PATH_FOR_TEST}
   ]
   CONFIG_CSV= %[
     #{CONFIG_BASE}
@@ -106,6 +110,7 @@ class RedshiftOutputTest < Test::Unit::TestCase
     assert_equal "csv", d.instance.file_type
     assert_equal ",", d.instance.delimiter
     assert_equal true, d.instance.utc
+    assert_equal MAINTENANCE_FILE_PATH_FOR_TEST, d.instance.maintenance_file_path
   end
   def test_configure_with_schemaname
     d = create_driver(CONFIG_JSON_WITH_SCHEMA)
@@ -211,53 +216,44 @@ class RedshiftOutputTest < Test::Unit::TestCase
     d_msgpack.run
   end
 
-  class PGConnectionMock
-    def initialize(options = {})
-      @return_keys = options[:return_keys] || ['key_a', 'key_b', 'key_c', 'key_d', 'key_e', 'key_f', 'key_g', 'key_h']
-      @target_schema = options[:schemaname] || nil
-      @target_table = options[:tablename] || 'test_table'
-    end
+  def setup_redshift_connection_mock(options = {})
+    options ||= {}
+    column_names = options[:column_names] || ['key_a', 'key_b', 'key_c', 'key_d', 'key_e', 'key_f', 'key_g', 'key_h']
+    schema_name = options[:schema_name]
+    table_name = options[:table_name] || 'test_table'
+    exec_sql_proc = options[:exec_sql_proc]
 
-    def expected_column_list_query
-      if @target_schema
-        /\Aselect column_name from INFORMATION_SCHEMA.COLUMNS where table_schema = '#{@target_schema}' and table_name = '#{@target_table}'/
+    column_list_query_regex =
+      if schema_name
+        /\Aselect column_name from INFORMATION_SCHEMA.COLUMNS where table_name = '#{table_name}' and table_schema = '#{schema_name}'/
       else
-        /\Aselect column_name from INFORMATION_SCHEMA.COLUMNS where table_name = '#{@target_table}'/
+        /\Aselect column_name from INFORMATION_SCHEMA.COLUMNS where table_name = '#{table_name}'/
       end
-    end
-
-    def expected_copy_query
-      if @target_schema
-        /\Acopy #{@target_schema}.#{@target_table} from/
+    copy_query_regex =
+      if schema_name
+        /\Acopy #{schema_name}.#{table_name} from/
       else
-        /\Acopy #{@target_table} from/
+        /\Acopy #{table_name} from/
       end
-    end
 
-    def exec(sql, &block)
-      if block_given?
-        if sql =~ expected_column_list_query
-          yield @return_keys.collect{|key| {'column_name' => key}}
+    flexmock(Fluent::RedshiftOutput::RedshiftConnection).new_instances do |conn|
+      conn.should_receive(:exec).and_return do |sql, block|
+        if exec_sql_proc
+          exec_sql_proc.call(sql, block)
+        elsif block
+          if sql =~ column_list_query_regex
+            block.call column_names.collect{|key| {'column_name' => key}}
+          else
+            block.call []
+          end
         else
-          yield []
-        end
-      else
-        unless sql =~ expected_copy_query
-          error = PG::Error.new("ERROR:  Load into table '#{@target_table}' failed.  Check 'stl_load_errors' system table for details.")
-          error.result = "ERROR:  Load into table '#{@target_table}' failed.  Check 'stl_load_errors' system table for details."
-          raise error
+          unless sql =~ copy_query_regex
+            error = PG::Error.new("ERROR:  Load into table '#{@target_table}' failed.  Check 'stl_load_errors' system table for details.")
+            error.result = "ERROR:  Load into table '#{@target_table}' failed.  Check 'stl_load_errors' system table for details."
+            raise Fluent::RedshiftOutput::RedshiftError.new(error)
+          end
         end
       end
-    end
-
-    def close
-    end
-  end
-
-  def setup_pg_mock
-    # create mock of PG
-    def PG.connect(dbinfo)
-      return PGConnectionMock.new
     end
   end
 
@@ -305,9 +301,10 @@ class RedshiftOutputTest < Test::Unit::TestCase
     flexmock(Tempfile).new_instances.should_receive(:close!).at_least.once
   end
 
-  def setup_mocks(expected_data)
-    setup_pg_mock
-    setup_s3_mock(expected_data) end
+  def setup_mocks(expected_data, options = {})
+    setup_redshift_connection_mock(options)
+    setup_s3_mock(expected_data)
+  end
 
   def test_write_with_csv
     setup_mocks(%[val_a,val_b,val_c,val_d\nval_e,val_f,val_g,val_h\n])
@@ -318,7 +315,7 @@ class RedshiftOutputTest < Test::Unit::TestCase
   end
 
   def test_write_with_json
-    setup_mocks(%[val_a\tval_b\t\t\t\t\t\t\n\t\tval_c\tval_d\t\t\t\t\n])
+    setup_mocks(%[val_a\tval_b\t\\N\t\\N\t\\N\t\\N\t\\N\t\\N\n\\N\t\\N\tval_c\tval_d\t\\N\t\\N\t\\N\t\\N\n])
     setup_tempfile_mock_to_be_closed
     d_json = create_driver(CONFIG_JSON)
     emit_json(d_json)
@@ -326,7 +323,7 @@ class RedshiftOutputTest < Test::Unit::TestCase
   end
 
   def test_write_with_json_hash_value
-    setup_mocks("val_a\t{\"foo\":\"var\"}\t\t\t\t\t\t\n\t\tval_c\tval_d\t\t\t\t\n")
+    setup_mocks("val_a\t{\"foo\":\"var\"}\t\\N\t\\N\t\\N\t\\N\t\\N\t\\N\n\\N\t\\N\tval_c\tval_d\t\\N\t\\N\t\\N\t\\N\n")
     d_json = create_driver(CONFIG_JSON)
     d_json.emit({"log" => %[{"key_a" : "val_a", "key_b" : {"foo" : "var"}}]} , DEFAULT_TIME)
     d_json.emit(RECORD_JSON_B, DEFAULT_TIME)
@@ -334,7 +331,7 @@ class RedshiftOutputTest < Test::Unit::TestCase
   end
 
   def test_write_with_json_array_value
-    setup_mocks("val_a\t[\"foo\",\"var\"]\t\t\t\t\t\t\n\t\tval_c\tval_d\t\t\t\t\n")
+    setup_mocks("val_a\t[\"foo\",\"var\"]\t\\N\t\\N\t\\N\t\\N\t\\N\t\\N\n\\N\t\\N\tval_c\tval_d\t\\N\t\\N\t\\N\t\\N\n")
     d_json = create_driver(CONFIG_JSON)
     d_json.emit({"log" => %[{"key_a" : "val_a", "key_b" : ["foo", "var"]}]} , DEFAULT_TIME)
     d_json.emit(RECORD_JSON_B, DEFAULT_TIME)
@@ -342,10 +339,17 @@ class RedshiftOutputTest < Test::Unit::TestCase
   end
 
   def test_write_with_json_including_tab_newline_quote
-    setup_mocks("val_a_with_\\\t_tab_\\\n_newline\tval_b_with_\\\\_quote\t\t\t\t\t\t\n\t\tval_c\tval_d\t\t\t\t\n")
+    setup_mocks("val_a_with_\\\t_tab_\\\n_newline\tval_b_with_\\\\_quote\t\\N\t\\N\t\\N\t\\N\t\\N\t\\N\n\\N\t\\N\tval_c\tval_d\t\\N\t\\N\t\\N\t\\N\n")
     d_json = create_driver(CONFIG_JSON)
     d_json.emit({"log" => %[{"key_a" : "val_a_with_\\t_tab_\\n_newline", "key_b" : "val_b_with_\\\\_quote"}]} , DEFAULT_TIME)
     d_json.emit(RECORD_JSON_B, DEFAULT_TIME)
+    assert_equal true, d_json.run
+  end
+
+  def test_write_with_json_empty_text_value
+    setup_mocks(%[val_a\t\t\\N\t\\N\t\\N\t\\N\t\\N\t\\N\n])
+    d_json = create_driver(CONFIG_JSON)
+    d_json.emit({"log" => %[{"key_a" : "val_a", "key_b" : ""}]} , DEFAULT_TIME)
     assert_equal true, d_json.run
   end
 
@@ -358,7 +362,7 @@ class RedshiftOutputTest < Test::Unit::TestCase
   end
 
   def test_write_with_json_invalid_one_line
-    setup_mocks(%[\t\tval_c\tval_d\t\t\t\t\n])
+    setup_mocks(%[\\N\t\\N\tval_c\tval_d\t\\N\t\\N\t\\N\t\\N\n])
     d_json = create_driver(CONFIG_JSON)
     d_json.emit({"log" => %[}}]}, DEFAULT_TIME)
     d_json.emit(RECORD_JSON_B, DEFAULT_TIME)
@@ -366,7 +370,7 @@ class RedshiftOutputTest < Test::Unit::TestCase
   end
 
   def test_write_with_json_no_available_data
-    setup_mocks(%[val_a\tval_b\t\t\t\t\t\t\n])
+    setup_mocks(%[val_a\tval_b\t\\N\t\\N\t\\N\t\\N\t\\N\t\\N\n])
     d_json = create_driver(CONFIG_JSON)
     d_json.emit(RECORD_JSON_A, DEFAULT_TIME)
     d_json.emit({"log" => %[{"key_o" : "val_o", "key_p" : "val_p"}]}, DEFAULT_TIME)
@@ -374,14 +378,14 @@ class RedshiftOutputTest < Test::Unit::TestCase
   end
 
   def test_write_with_msgpack
-    setup_mocks(%[val_a\tval_b\t\t\t\t\t\t\n\t\tval_c\tval_d\t\t\t\t\n])
+    setup_mocks(%[val_a\tval_b\t\\N\t\\N\t\\N\t\\N\t\\N\t\\N\n\\N\t\\N\tval_c\tval_d\t\\N\t\\N\t\\N\t\\N\n])
     d_msgpack = create_driver(CONFIG_MSGPACK)
     emit_msgpack(d_msgpack)
     assert_equal true, d_msgpack.run
   end
 
   def test_write_with_msgpack_hash_value
-    setup_mocks("val_a\t{\"foo\":\"var\"}\t\t\t\t\t\t\n\t\tval_c\tval_d\t\t\t\t\n")
+    setup_mocks("val_a\t{\"foo\":\"var\"}\t\\N\t\\N\t\\N\t\\N\t\\N\t\\N\n\\N\t\\N\tval_c\tval_d\t\\N\t\\N\t\\N\t\\N\n")
     d_msgpack = create_driver(CONFIG_MSGPACK)
     d_msgpack.emit({"key_a" => "val_a", "key_b" => {"foo" => "var"}} , DEFAULT_TIME)
     d_msgpack.emit(RECORD_MSGPACK_B, DEFAULT_TIME)
@@ -389,7 +393,7 @@ class RedshiftOutputTest < Test::Unit::TestCase
   end
 
   def test_write_with_msgpack_array_value
-    setup_mocks("val_a\t[\"foo\",\"var\"]\t\t\t\t\t\t\n\t\tval_c\tval_d\t\t\t\t\n")
+    setup_mocks("val_a\t[\"foo\",\"var\"]\t\\N\t\\N\t\\N\t\\N\t\\N\t\\N\n\\N\t\\N\tval_c\tval_d\t\\N\t\\N\t\\N\t\\N\n")
     d_msgpack = create_driver(CONFIG_MSGPACK)
     d_msgpack.emit({"key_a" => "val_a", "key_b" => ["foo", "var"]} , DEFAULT_TIME)
     d_msgpack.emit(RECORD_MSGPACK_B, DEFAULT_TIME)
@@ -397,7 +401,7 @@ class RedshiftOutputTest < Test::Unit::TestCase
   end
 
   def test_write_with_msgpack_including_tab_newline_quote
-    setup_mocks("val_a_with_\\\t_tab_\\\n_newline\tval_b_with_\\\\_quote\t\t\t\t\t\t\n\t\tval_c\tval_d\t\t\t\t\n")
+    setup_mocks("val_a_with_\\\t_tab_\\\n_newline\tval_b_with_\\\\_quote\t\\N\t\\N\t\\N\t\\N\t\\N\t\\N\n\\N\t\\N\tval_c\tval_d\t\\N\t\\N\t\\N\t\\N\n")
     d_msgpack = create_driver(CONFIG_MSGPACK)
     d_msgpack.emit({"key_a" => "val_a_with_\t_tab_\n_newline", "key_b" => "val_b_with_\\_quote"} , DEFAULT_TIME)
     d_msgpack.emit(RECORD_MSGPACK_B, DEFAULT_TIME)
@@ -413,7 +417,7 @@ class RedshiftOutputTest < Test::Unit::TestCase
   end
 
   def test_write_with_msgpack_no_available_data
-    setup_mocks(%[val_a\tval_b\t\t\t\t\t\t\n])
+    setup_mocks(%[val_a\tval_b\t\\N\t\\N\t\\N\t\\N\t\\N\t\\N\n])
     d_msgpack = create_driver(CONFIG_MSGPACK)
     d_msgpack.emit(RECORD_MSGPACK_A, DEFAULT_TIME)
     d_msgpack.emit({"key_o" => "val_o", "key_p" => "val_p"}, DEFAULT_TIME)
@@ -421,38 +425,21 @@ class RedshiftOutputTest < Test::Unit::TestCase
   end
 
   def test_write_redshift_connection_error
-    def PG.connect(dbinfo)
-      return Class.new do
-        def initialize(return_keys=[]); end
-        def exec(sql)
-          raise PG::Error, "redshift connection error"
-        end
-        def close; end
-      end.new
-    end
-    setup_s3_mock(%[val_a,val_b,val_c,val_d\nval_e,val_f,val_g,val_h\n])
-
+    setup_mocks(%[val_a,val_b,val_c,val_d\nval_e,val_f,val_g,val_h\n],
+      exec_sql_proc: Proc.new {|sql, block| raise Fluent::RedshiftOutput::RedshiftError, "redshift connection error" })
     d_csv = create_driver
     emit_csv(d_csv)
-    assert_raise(PG::Error) {
+    assert_raise(Fluent::RedshiftOutput::RedshiftError) {
       d_csv.run
     }
   end
 
   def test_write_redshift_load_error
-    PG::Error.module_eval { attr_accessor :result}
-    def PG.connect(dbinfo)
-      return Class.new do
-        def initialize(return_keys=[]); end
-        def exec(sql)
-          error = PG::Error.new("ERROR:  Load into table 'apache_log' failed.  Check 'stl_load_errors' system table for details.")
-          error.result = "ERROR:  Load into table 'apache_log' failed.  Check 'stl_load_errors' system table for details."
-          raise error
-        end
-        def close; end
-      end.new
-    end
-    setup_s3_mock(%[val_a,val_b,val_c,val_d\nval_e,val_f,val_g,val_h\n])
+    setup_mocks(%[val_a,val_b,val_c,val_d\nval_e,val_f,val_g,val_h\n],
+      exec_sql_proc: Proc.new {|sql, block|
+      msg = "ERROR:  Load into table 'apache_log' failed.  Check 'stl_load_errors' system table for details."
+      raise Fluent::RedshiftOutput::RedshiftError.new(msg)
+    })
 
     d_csv = create_driver
     emit_csv(d_csv)
@@ -460,36 +447,19 @@ class RedshiftOutputTest < Test::Unit::TestCase
   end
 
   def test_write_with_json_redshift_connection_error
-    def PG.connect(dbinfo)
-      return Class.new do
-        def initialize(return_keys=[]); end
-        def exec(sql, &block)
-          error = PG::Error.new("redshift connection error")
-          raise error
-        end
-        def close; end
-      end.new
-    end
-    setup_s3_mock(%[val_a,val_b,val_c,val_d\nval_e,val_f,val_g,val_h\n])
+    setup_mocks(%[val_a,val_b,val_c,val_d\nval_e,val_f,val_g,val_h\n],
+      exec_sql_proc: Proc.new {|sql, block| raise Fluent::RedshiftOutput::RedshiftError.new("redshift connection error")})
 
     d_json = create_driver(CONFIG_JSON)
     emit_json(d_json)
-    assert_raise(PG::Error) {
+    assert_raise(Fluent::RedshiftOutput::RedshiftError) {
       d_json.run
     }
   end
 
   def test_write_with_json_no_table_on_redshift
-    def PG.connect(dbinfo)
-      return Class.new do
-        def initialize(return_keys=[]); end
-        def exec(sql, &block)
-          yield [] if block_given?
-        end
-        def close; end
-      end.new
-    end
-    setup_s3_mock(%[val_a,val_b,val_c,val_d\nval_e,val_f,val_g,val_h\n])
+    setup_mocks(%[val_a,val_b,val_c,val_d\nval_e,val_f,val_g,val_h\n],
+                exec_sql_proc: Proc.new {|sql, block| block.call [] if block })
 
     d_json = create_driver(CONFIG_JSON)
     emit_json(d_json)
@@ -497,15 +467,7 @@ class RedshiftOutputTest < Test::Unit::TestCase
   end
 
   def test_write_with_json_failed_to_get_columns
-    def PG.connect(dbinfo)
-      return Class.new do
-        def initialize(return_keys=[]); end
-        def exec(sql, &block)
-        end
-        def close; end
-      end.new
-    end
-    setup_s3_mock("")
+    setup_mocks("", exec_sql_proc: Proc.new {|sql, block| nil})
 
     d_json = create_driver(CONFIG_JSON)
     emit_json(d_json)
@@ -515,12 +477,21 @@ class RedshiftOutputTest < Test::Unit::TestCase
   end
 
   def test_write_with_json_fetch_column_with_schema
-    def PG.connect(dbinfo)
-      return PGConnectionMock.new(:schemaname => 'test_schema')
-    end
-    setup_s3_mock(%[val_a\tval_b\t\t\t\t\t\t\n\t\tval_c\tval_d\t\t\t\t\n])
+    setup_mocks(%[val_a\tval_b\t\\N\t\\N\t\\N\t\\N\t\\N\t\\N\n\\N\t\\N\tval_c\tval_d\t\\N\t\\N\t\\N\t\\N\n],
+               schema_name: 'test_schema')
     d_json = create_driver(CONFIG_JSON_WITH_SCHEMA)
     emit_json(d_json)
     assert_equal true, d_json.run
+  end
+
+  def test_maintenance_mode
+    flexmock(File).should_receive(:exists?).with(MAINTENANCE_FILE_PATH_FOR_TEST).and_return(true)
+
+    d_json = create_driver(CONFIG_JSON)
+    emit_json(d_json)
+    assert_raise(Fluent::RedshiftOutput::MaintenanceError,
+                 "Service is in maintenance mode - maintenance_file_path:#{MAINTENANCE_FILE_PATH_FOR_TEST}") {
+      d_json.run
+    }
   end
 end

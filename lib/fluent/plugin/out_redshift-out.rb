@@ -4,12 +4,14 @@ module Fluent
 class RedshiftOutput < BufferedOutput
   Fluent::Plugin.register_output('redshift-out', self)
 
+  NULL_CHAR_FOR_COPY = "\\N"
+
   # ignore load table error. (invalid data format)
   IGNORE_REDSHIFT_ERROR_REGEXP = /^ERROR:  Load into table '[^']+' failed\./
 
   def initialize
     super
-    require 'aws-sdk'
+    require 'aws-sdk-v1'
     require 'zlib'
     require 'time'
     require 'tempfile'
@@ -22,8 +24,8 @@ class RedshiftOutput < BufferedOutput
 
   config_param :record_log_tag, :string, :default => 'log'
   # s3
-  config_param :aws_key_id, :string, :default => nil
-  config_param :aws_sec_key, :string, :default => nil
+  config_param :aws_key_id, :string, :secret => true, :default => nil
+  config_param :aws_sec_key, :string, :secret => true, :default => nil
   config_param :s3_bucket, :string
   config_param :s3_region, :string, :default => nil
   config_param :path, :string, :default => ""
@@ -34,7 +36,7 @@ class RedshiftOutput < BufferedOutput
   config_param :redshift_port, :integer, :default => 5439
   config_param :redshift_dbname, :string
   config_param :redshift_user, :string
-  config_param :redshift_password, :string
+  config_param :redshift_password, :string, :secret => true
   config_param :redshift_tablename, :string
   config_param :redshift_schemaname, :string, :default => nil
   config_param :redshift_copy_base_options, :string , :default => "FILLRECORD ACCEPTANYDATE TRUNCATECOLUMNS"
@@ -43,6 +45,8 @@ class RedshiftOutput < BufferedOutput
   # file format
   config_param :file_type, :string, :default => nil  # json, tsv, csv, msgpack
   config_param :delimiter, :string, :default => nil
+  # maintenance
+  config_param :maintenance_file_path, :string, :default => nil
   # for debug
   config_param :log_suffix, :string, :default => ''
 
@@ -61,6 +65,8 @@ class RedshiftOutput < BufferedOutput
     }
     @delimiter = determine_delimiter(@file_type) if @delimiter.nil? or @delimiter.empty?
     $log.debug format_log("redshift file_type:#{@file_type} delimiter:'#{@delimiter}'")
+    @table_name_with_schema = [@redshift_schemaname, @redshift_tablename].compact.join('.')
+    @maintenance_monitor = MaintenanceMonitor.new(@maintenance_file_path)
   end
 
   def start
@@ -74,6 +80,7 @@ class RedshiftOutput < BufferedOutput
     options[:region] = @s3_region if @s3_region
     @s3 = AWS::S3.new(options)
     @bucket = @s3.buckets[@s3_bucket]
+    @redshift_connection = RedshiftConnection.new(@db_conf)
   end
 
   def format(tag, time, record)
@@ -88,6 +95,7 @@ class RedshiftOutput < BufferedOutput
 
   def write(chunk)
     $log.debug format_log("start creating gz.")
+    @maintenance_monitor.check_maintenance!
 
     # create a gz file
     tmp = Tempfile.new("s3-")
@@ -117,7 +125,7 @@ class RedshiftOutput < BufferedOutput
     # copy gz on s3 to redshift
     s3_uri = "s3://#{@s3_bucket}/#{s3path}"
     credentials = @s3.client.credential_provider.credentials
-    sql = "copy #{table_name_with_schema} from '#{s3_uri}'"
+    sql = "copy #{@table_name_with_schema} from '#{s3_uri}'"
     sql += " CREDENTIALS 'aws_access_key_id=#{credentials[:access_key_id]};aws_secret_access_key=#{credentials[:secret_access_key]}"
     sql += ";token=#{credentials[:session_token]}" if credentials[:session_token]
     sql += "' delimiter '#{@delimiter}' GZIP ESCAPE #{@redshift_copy_base_options} #{@redshift_copy_options};"
@@ -125,25 +133,26 @@ class RedshiftOutput < BufferedOutput
     $log.debug format_log("start copying. s3_uri=#{s3_uri}")
 
     begin
-      conn = PG.connect(@db_conf)
-      conn.exec(sql)
+      @redshift_connection.exec(sql)
       $log.info format_log("completed copying to redshift. s3_uri=#{s3_uri}")
-    rescue PG::Error => e
-      $log.error format_log("failed to copy data into redshift. s3_uri=#{s3_uri}"), :error=>e.to_s
-      raise e unless e.to_s =~ IGNORE_REDSHIFT_ERROR_REGEXP
-      return false # for debug
-    ensure
-      conn.close rescue nil if conn
+    rescue RedshiftError => e
+      if e.to_s =~ IGNORE_REDSHIFT_ERROR_REGEXP
+        $log.error format_log("failed to copy data into redshift due to load error. s3_uri=#{s3_uri}"), :error=>e.to_s
+        return false # for debug
+      end
+      raise e
     end
     true # for debug
   end
 
   protected
+
   def format_log(message)
     (@log_suffix and not @log_suffix.empty?) ? "#{message} #{@log_suffix}" : message
   end
 
   private
+
   def json?
     @file_type == 'json'
   end
@@ -165,11 +174,11 @@ class RedshiftOutput < BufferedOutput
 
   def create_gz_file_from_structured_data(dst_file, chunk, delimiter)
     # fetch the table definition from redshift
-    redshift_table_columns = fetch_table_columns
+    redshift_table_columns = @redshift_connection.fetch_table_columns(@redshift_tablename, @redshift_schemaname)
     if redshift_table_columns == nil
       raise "failed to fetch the redshift table definition."
     elsif redshift_table_columns.empty?
-      $log.warn format_log("no table on redshift. table_name=#{table_name_with_schema}")
+      $log.warn format_log("no table on redshift. table_name=#{@table_name_with_schema}")
       return nil
     end
 
@@ -184,12 +193,7 @@ class RedshiftOutput < BufferedOutput
           tsv_text = hash_to_table_text(redshift_table_columns, hash, delimiter)
           gzw.write(tsv_text) if tsv_text and not tsv_text.empty?
         rescue => e
-          if json?
-            $log.error format_log("failed to create table text from json. text=(#{record[@record_log_tag]})"), :error=>e.to_s
-          else
-            $log.error format_log("failed to create table text from msgpack. text=(#{record[@record_log_tag]})"), :error=>e.to_s
-          end
-
+          $log.error format_log("failed to create table text from #{@file_type}. text=(#{record[@record_log_tag]})"), :error=>e.to_s
           $log.error_backtrace
         end
       end
@@ -211,27 +215,6 @@ class RedshiftOutput < BufferedOutput
     end
   end
 
-  def fetch_table_columns
-    begin
-      columns = nil
-      conn = PG.connect(@db_conf)
-      conn.exec(fetch_columns_sql_with_schema) do |result|
-        columns = result.collect{|row| row['column_name']}
-      end
-      columns
-    ensure
-      conn.close rescue nil if conn
-    end
-  end
-
-  def fetch_columns_sql_with_schema
-    @fetch_columns_sql ||= if @redshift_schemaname
-                             "select column_name from INFORMATION_SCHEMA.COLUMNS where table_schema = '#{@redshift_schemaname}' and table_name = '#{@redshift_tablename}' order by ordinal_position;"
-                           else
-                             "select column_name from INFORMATION_SCHEMA.COLUMNS where table_name = '#{@redshift_tablename}' order by ordinal_position;"
-                           end
-  end
-
   def json_to_hash(json_text)
     return nil if json_text.to_s.empty?
 
@@ -245,18 +228,9 @@ class RedshiftOutput < BufferedOutput
     return "" unless hash
 
     # extract values from hash
-    val_list = redshift_table_columns.collect do |cn|
-      val = hash[cn]
-      val = MultiJson.dump(val) if val.kind_of?(Hash) or val.kind_of?(Array)
+    val_list = redshift_table_columns.collect {|cn| hash[cn]}
 
-      if val.to_s.empty?
-        nil
-      else
-        val.to_s
-      end
-    end
-
-    if val_list.all?{|v| v.nil? or v.empty?}
+    if val_list.all?{|v| v.nil?}
       $log.warn format_log("no data match for table columns on redshift. data=#{hash} table_columns=#{redshift_table_columns}")
       return ""
     end
@@ -265,14 +239,22 @@ class RedshiftOutput < BufferedOutput
   end
 
   def generate_line_with_delimiter(val_list, delimiter)
-    val_list = val_list.collect do |val|
-      if val.nil? or val.empty?
-        ""
+    val_list.collect do |val|
+      case val
+      when nil
+        NULL_CHAR_FOR_COPY
+      when ''
+        ''
+      when Hash, Array
+        escape_text_for_copy(MultiJson.dump(val))
       else
-        val.gsub(/\\/, "\\\\\\").gsub(/\t/, "\\\t").gsub(/\n/, "\\\n") # escape tab, newline and backslash
+        escape_text_for_copy(val.to_s)
       end
-    end
-    val_list.join(delimiter) + "\n"
+    end.join(delimiter) + "\n"
+  end
+
+  def escape_text_for_copy(val)
+    val.gsub(/\\|\t|\n/, {"\\" => "\\\\", "\t" => "\\\t", "\n" => "\\\n"})  # escape tab, newline and backslash
   end
 
   def create_s3path(bucket, path)
@@ -286,12 +268,124 @@ class RedshiftOutput < BufferedOutput
     s3path
   end
 
-  def table_name_with_schema
-    @table_name_with_schema ||= if @redshift_schemaname
-                                  "#{@redshift_schemaname}.#{@redshift_tablename}"
-                                else
-                                  @redshift_tablename
-                                end
+  class RedshiftError < StandardError
+    def initialize(msg)
+      case msg
+      when PG::Error
+        @pg_error = msg
+        super(msg.to_s)
+        set_backtrace(msg.backtrace)
+      else
+        super
+      end
+    end
+
+    attr_accessor :pg_error
+  end
+
+  class RedshiftConnection
+    REDSHIFT_CONNECT_TIMEOUT = 10.0  # 10sec
+
+    def initialize(db_conf)
+      @db_conf = db_conf
+      @connection = nil
+    end
+
+    attr_reader :db_conf
+
+    def fetch_table_columns(table_name, schema_name)
+      columns = nil
+      exec(fetch_columns_sql(table_name, schema_name)) do |result|
+        columns = result.collect{|row| row['column_name']}
+      end
+      columns
+    end
+
+    def exec(sql, &block)
+      conn = @connection
+      conn = create_redshift_connection if conn.nil?
+      if block
+        conn.exec(sql) {|result| block.call(result)}
+      else
+        conn.exec(sql)
+      end
+    rescue PG::Error => e
+      raise RedshiftError.new(e)
+    ensure
+      conn.close if conn && @connection.nil?
+    end
+
+    def connect_start
+      @connection = create_redshift_connection
+    end
+
+    def close
+      @connection.close rescue nil if @connection
+      @connection = nil
+    end
+
+    private
+
+    def create_redshift_connection
+      hostaddr = IPSocket.getaddress(db_conf[:host])
+      db_conf[:hostaddr] = hostaddr
+
+      conn = PG::Connection.connect_start(db_conf)
+      raise RedshiftError.new("Unable to create a new connection.") unless conn
+      if conn.status == PG::CONNECTION_BAD
+        raise RedshiftError.new("Connection failed: %s" % [ conn.error_message ])
+      end
+
+      socket = conn.socket_io
+      poll_status = PG::PGRES_POLLING_WRITING
+      until poll_status == PG::PGRES_POLLING_OK || poll_status == PG::PGRES_POLLING_FAILED
+        case poll_status
+        when PG::PGRES_POLLING_READING
+          IO.select([socket], nil, nil, REDSHIFT_CONNECT_TIMEOUT) or
+            raise RedshiftError.new("Asynchronous connection timed out!(READING)")
+        when PG::PGRES_POLLING_WRITING
+          IO.select(nil, [socket], nil, REDSHIFT_CONNECT_TIMEOUT) or
+            raise RedshiftError.new("Asynchronous connection timed out!(WRITING)")
+        end
+        poll_status = conn.connect_poll
+      end
+
+      unless conn.status == PG::CONNECTION_OK
+        raise RedshiftError, ("Connect failed: %s" % [conn.error_message.to_s.lines.uniq.join(" ")])
+      end
+
+      conn
+    rescue => e
+      conn.close rescue nil if conn
+      raise RedshiftError.new(e) if e.kind_of?(PG::Error)
+      raise e
+    end
+
+    def fetch_columns_sql(table_name, schema_name = nil)
+      sql = "select column_name from INFORMATION_SCHEMA.COLUMNS where table_name = '#{table_name}'"
+      sql << " and table_schema = '#{schema_name}'" if schema_name
+      sql << " order by ordinal_position;"
+      sql
+    end
+  end
+
+  class MaintenanceError < StandardError
+  end
+
+  class MaintenanceMonitor
+    def initialize(maintenance_file_path)
+      @file_path = maintenance_file_path
+    end
+
+    def in_maintenance?
+      !!(@file_path && File.exists?(@file_path))
+    end
+
+    def check_maintenance!
+      if in_maintenance?
+        raise MaintenanceError.new("Service is in maintenance mode - maintenance_file_path:#{@file_path}")
+      end
+    end
   end
 end
 
