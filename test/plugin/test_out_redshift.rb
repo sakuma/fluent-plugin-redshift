@@ -187,6 +187,7 @@ class RedshiftOutputTest < Test::Unit::TestCase
   end
 
   def test_format_csv
+    setup_mocks("")
     d_csv = create_driver_no_write(CONFIG_CSV)
     emit_csv(d_csv)
     d_csv.expect_format RECORD_CSV_A['log'] + "\n"
@@ -194,6 +195,7 @@ class RedshiftOutputTest < Test::Unit::TestCase
     d_csv.run
   end
   def test_format_tsv
+    setup_mocks("")
     d_tsv = create_driver_no_write(CONFIG_TSV)
     emit_tsv(d_tsv)
     d_tsv.expect_format RECORD_TSV_A['log'] + "\n"
@@ -201,6 +203,7 @@ class RedshiftOutputTest < Test::Unit::TestCase
     d_tsv.run
   end
   def test_format_json
+    setup_mocks("")
     d_json = create_driver_no_write(CONFIG_JSON)
     emit_json(d_json)
     d_json.expect_format RECORD_JSON_A.to_msgpack
@@ -209,6 +212,7 @@ class RedshiftOutputTest < Test::Unit::TestCase
   end
 
   def test_format_msgpack
+    setup_mocks("")
     d_msgpack = create_driver_no_write(CONFIG_MSGPACK)
     emit_msgpack(d_msgpack)
     d_msgpack.expect_format({ 'log' => RECORD_MSGPACK_A }.to_msgpack)
@@ -254,6 +258,7 @@ class RedshiftOutputTest < Test::Unit::TestCase
           end
         end
       end
+      conn.should_receive(:connect_start)
     end
   end
 
@@ -485,6 +490,7 @@ class RedshiftOutputTest < Test::Unit::TestCase
   end
 
   def test_maintenance_mode
+    setup_mocks("")
     flexmock(File).should_receive(:exists?).with(MAINTENANCE_FILE_PATH_FOR_TEST).and_return(true)
 
     d_json = create_driver(CONFIG_JSON)
