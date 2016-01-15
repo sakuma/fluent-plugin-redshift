@@ -81,6 +81,7 @@ class RedshiftOutput < BufferedOutput
     @s3 = AWS::S3.new(options)
     @bucket = @s3.buckets[@s3_bucket]
     @redshift_connection = RedshiftConnection.new(@db_conf)
+    @redshift_connection.connect_start
   end
 
   def format(tag, time, record)
@@ -289,6 +290,9 @@ class RedshiftOutput < BufferedOutput
     def initialize(db_conf)
       @db_conf = db_conf
       @connection = nil
+      ObjectSpace.define_finalizer(self) {
+        close()
+      } 
     end
 
     attr_reader :db_conf
